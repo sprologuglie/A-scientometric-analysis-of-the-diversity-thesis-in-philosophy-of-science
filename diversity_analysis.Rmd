@@ -1,0 +1,636 @@
+---
+title: "Gender and affiliation diversity in philosophy of science"
+author: "Guglielmo Sproloquio"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: false
+    theme: cosmo
+    code_folding: hide
+---
+
+```{r knitr-options, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# Setup
+
+We begin by loading the libraries and importing the tables we need.
+
+Paths are resolved from the repository root with `here::here()`.
+The SOPHIS tables are **not** versioned: place them in `data/` (see `data/README.md`).
+
+```{r setup}
+library(broom.mixed)   # tidy() for the IRR table
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpmisc)       # R^2 annotations
+library(readr)
+library(fixest)        # fixed-effects negative binomial regression
+library(vegan)         # Shannon entropy
+library(reactable)
+library(ggrepel)
+library(modelsummary)
+library(here)
+
+data_dir <- here("data")
+
+read_table <- function(name) {
+  read.csv(file.path(data_dir, paste0(name, ".csv")))
+}
+
+article     <- read_table("article")
+actor       <- read_table("actor")
+affiliation <- read_table("affiliation")
+authorship  <- read_table("authorship")
+mention     <- read_table("mention")
+prize       <- read_table("prize")
+association <- read_table("association")
+clustering  <- read_table("clustering")
+cluster     <- read_table("cluster")   # sub-field labels
+
+research_articles <- read_delim(
+  file.path(data_dir, "6826_Research_Articles.csv"),
+  delim = ";", escape_double = FALSE, trim_ws = TRUE,
+  show_col_types = FALSE
+)
+```
+
+# Preliminaries
+
+We merge authors and acknowledgees of articles in a single category called "contributors".
+
+```{r contributors}
+# Authors and acknowledgees in a single table
+authors_set <- authorship %>%
+  select(UT, H_ID) %>%
+  mutate(contribution_type = "Author")
+
+ackgees_set <- mention %>%
+  filter(H_ID != "") %>%
+  select(UT, H_ID) %>%
+  mutate(contribution_type = "Acknowledgee")
+
+contributions <- rbind(authors_set, ackgees_set) %>%
+  arrange(UT, desc(contribution_type)) %>%
+  rename(contributor = H_ID)
+```
+
+We assign gender and affiliation to each contributor.
+
+```{r gender-and-affiliations}
+# Contributors' affiliation, matched on the article's publication year
+cont_with_aff <- contributions %>%
+  left_join(article %>% select(UT, Pub_Year), by = "UT") %>%
+  left_join(affiliation, by = c("contributor" = "H_ID", "Pub_Year" = "Year"))
+
+university <- cont_with_aff %>%
+  filter(!is.na(Inst_ID)) %>%
+  group_by(UT) %>%
+  summarise(
+    n_universities = n_distinct(Inst_ID),
+    universities   = list(unique(Inst_ID)),
+    .groups = "drop"
+  )
+
+# In another table we assign contributors' gender
+gender <- contributions %>%
+  left_join(actor %>% select(H_ID, Gender), by = c("contributor" = "H_ID")) %>%
+  filter(Gender != "") %>%
+  group_by(UT) %>%
+  summarise(
+    n_generi = n_distinct(Gender),
+    generi   = list(unique(Gender)),
+    .groups  = "drop"
+  )
+```
+
+We add the total number of citations received by each article and merge all the information in a single table.
+Importantly, we keep only articles with **more than one contributor** (team size > 1).
+
+```{r mentions-and-articles}
+# Total citations per article
+citations <- research_articles %>%
+  select(UT, TC)
+
+# Articles, number of contributors, gender, affiliations and citations
+div_article <- article %>%
+  left_join(
+    contributions %>%
+      group_by(UT) %>%
+      summarise(
+        conts   = list(unique(contributor)),
+        n_conts = n_distinct(contributor),
+        .groups = "drop"
+      ),
+    by = "UT"
+  ) %>%
+  left_join(university, by = "UT") %>%
+  left_join(gender, by = "UT") %>%
+  left_join(citations, by = "UT") %>%
+  filter(n_conts > 1) %>%   # <- team size > 1
+  select(UT, Pub_Year, Journal_Complete, conts, n_conts,
+         universities, n_universities, generi, n_generi, TC)
+
+nrow(div_article)
+```
+
+A 10-row preview of the table (the full table is deliberately not embedded in the report, so that the published page does not redistribute the underlying records):
+
+```{r preview-div-article}
+div_article %>%
+  select(-conts, -universities, -generi) %>%
+  slice_head(n = 10) %>%
+  reactable()
+```
+
+A quick diagnostic: how many (article, person) pairs appear more than once among the contributors?
+This happens, for instance, when the same person is both author and acknowledgee of the same article.
+Such pairs count once in `n_conts` (which uses `n_distinct()`) but twice in the gender and affiliation counts below.
+
+```{r duplicated-contributors}
+contributions %>%
+  count(UT, contributor) %>%
+  filter(n > 1) %>%
+  nrow()
+```
+
+# First insights
+
+## Descriptive statistics table
+
+Here we compile some descriptive statistics in absolute terms.
+
+```{r descriptive-table}
+# Contributor-type stats
+stats_cont <- contributions %>%
+  group_by(UT) %>%
+  summarise(
+    n_authors      = sum(contribution_type == "Author"),
+    n_acknowledges = sum(contribution_type == "Acknowledgee"),
+    # guard against articles with acknowledgees but no listed author (would be Inf)
+    acks_per_author = if_else(n_authors > 0, n_acknowledges / n_authors, NA_real_),
+    .groups = "drop"
+  ) %>%
+  filter(n_authors + n_acknowledges > 1)
+
+# Descriptive table
+div_article %>%
+  left_join(stats_cont, by = "UT") %>%
+  summarise(
+    mean_team_size                  = mean(n_conts),
+    median_team_size                = median(n_conts),
+    mean_acknowledgees_per_author   = mean(acks_per_author, na.rm = TRUE),
+    median_acknowledgees_per_author = median(acks_per_author, na.rm = TRUE),
+    perc_mixed_gender       = sum(n_generi == 2, na.rm = TRUE) / sum(!is.na(n_generi)),
+    perc_between_uni_collab = sum(n_universities > 1, na.rm = TRUE) / sum(!is.na(n_universities)),
+    mean_citations   = mean(TC, na.rm = TRUE),
+    median_citations = median(TC, na.rm = TRUE)
+  ) %>%
+  reactable()
+```
+
+...and over the years.
+
+```{r years-descriptive-table}
+div_article %>%
+  group_by(Pub_Year) %>%
+  summarise(
+    mean_team_size_per_year   = mean(n_conts),
+    median_team_size_per_year = median(n_conts),
+    perc_mixed_gender_per_year =
+      sum(n_generi == 2, na.rm = TRUE) / sum(!is.na(n_generi)),
+    perc_between_uni_collab_per_year =
+      sum(n_universities > 1, na.rm = TRUE) / sum(!is.na(n_universities)),
+    mean_citations_per_year   = mean(TC, na.rm = TRUE),
+    median_citations_per_year = median(TC, na.rm = TRUE)
+  ) %>%
+  reactable()
+```
+
+## Team size and type of contribution
+
+Here we plot the cumulative distribution of the number of authors, the number of acknowledgees and the total team size, and the frequency of team sizes.
+By far the most frequent number of authors is 1, while the number of acknowledgees is more spread out, even if smaller amounts are more frequent.
+The minimum team size is 2, since we kept only teams with at least two contributors, and smaller teams are more frequent.
+
+```{r team-size-and-contribution-plots, echo=FALSE}
+# Number of authors
+ggplot(stats_cont, aes(x = n_authors)) +
+  stat_ecdf(color = "lightgreen", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Number of authors", y = "Cumulative share of papers") +
+  scale_x_continuous(breaks = seq(0, 13, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1))
+
+# Number of acknowledgees
+ggplot(stats_cont, aes(x = n_acknowledges)) +
+  stat_ecdf(color = "green3", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Number of acknowledgees", y = "Cumulative share of papers") +
+  scale_x_continuous(breaks = seq(0, 44, by = 5)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1))
+
+# Cumulative frequency of team size
+ggplot(div_article, aes(x = n_conts)) +
+  stat_ecdf(color = "chartreuse3", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Team size", y = "Cumulative share of papers") +
+  scale_x_continuous(breaks = seq(2, 45, by = 2)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1))
+
+# Team size frequency
+ggplot(div_article, aes(x = n_conts)) +
+  geom_bar(fill = "chartreuse3") +
+  theme_minimal() +
+  labs(x = "Team size", y = "Number of teams") +
+  scale_x_continuous(breaks = seq(2, 45, by = 2)) +
+  scale_y_continuous(breaks = seq(0, 900, by = 100))
+```
+
+## Contribution type over team size
+
+As team size increases, generally fewer contributors are acknowledgees and more are authors.
+This supports the idea that part of the differences in team size are due to differences in authorship practices.
+
+```{r contribution-type-and-team-size, echo=FALSE}
+ggplot(stats_cont, aes(x = n_authors, y = n_acknowledges)) +
+  geom_point(color = "darkolivegreen3", alpha = 0.3, size = 1.5) +
+  theme_minimal() +
+  labs(x = "Number of authors", y = "Number of acknowledgees") +
+  scale_x_continuous(breaks = seq(0, 13, by = 1))
+```
+
+## Team size over the years
+
+There is a small increase of the mean team size over the years.
+The same pattern is observed using only authors as the measure of team size, which gives more confidence in the reliability of the method.
+
+```{r team-size-years, echo=FALSE}
+# Team size over the years
+team_size_years <- div_article %>%
+  group_by(Pub_Year) %>%
+  summarise(mean_team_size = mean(n_conts), .groups = "drop")
+
+ggplot(team_size_years, aes(x = Pub_Year, y = mean_team_size)) +
+  geom_line(color = "chartreuse3", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year", y = "Mean team size")
+
+# Team size, authors only
+author_size_years <- stats_cont %>%
+  inner_join(div_article %>% select(UT, Pub_Year), by = "UT") %>%
+  group_by(Pub_Year) %>%
+  summarise(mean_team_size = mean(n_authors), .groups = "drop")
+
+ggplot(author_size_years, aes(x = Pub_Year, y = mean_team_size)) +
+  geom_line(color = "chartreuse3", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year", y = "Mean author number")
+```
+
+## Gender composition
+
+We now inspect gender composition: almost 60% of the teams are mixed-gender.
+
+```{r gender-composition, echo=FALSE}
+gender_comp <- div_article %>%
+  mutate(gender_composition = case_when(
+    n_generi == 1 ~ "Mono-Gender",
+    n_generi == 2 ~ "Mixed-Gender",
+    TRUE          ~ NA_character_
+  ))
+
+gender_comp %>%
+  filter(!is.na(gender_composition)) %>%
+  ggplot(aes(x = gender_composition, fill = gender_composition)) +
+  geom_bar() +
+  theme_classic() +
+  labs(x = "", fill = "Gender composition", y = "Number of teams")
+```
+
+## Gender composition over the years
+
+The increase in mixed-gender teams is more pronounced than in mono-gender ones.
+
+```{r gender-composition-years, echo=FALSE}
+gender_comp_year <- gender_comp %>%
+  filter(!is.na(gender_composition)) %>%
+  group_by(gender_composition, Pub_Year) %>%
+  summarise(n_papers = n_distinct(UT), .groups = "drop")
+
+ggplot(gender_comp_year, aes(x = Pub_Year, y = n_papers, color = gender_composition)) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year", y = "Number of papers", color = "Gender composition") +
+  scale_x_continuous(breaks = seq(2005, 2019, by = 1))
+```
+
+## Number of affiliations
+
+The most frequent number of affiliations is 2: between-university collaborations are very widespread.
+
+```{r number-of-affiliations, echo=FALSE}
+ggplot(div_article, aes(x = n_universities)) +
+  geom_bar(fill = "darkgoldenrod2") +
+  theme_minimal() +
+  labs(x = "Number of affiliations", y = "Number of teams") +
+  scale_x_continuous(breaks = seq(1, 29, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 1200, by = 100))
+```
+
+## Number of affiliations per year
+
+There is a small increase of the mean number of universities over the years.
+
+```{r affiliations-per-year, echo=FALSE}
+mean_aff_years <- div_article %>%
+  group_by(Pub_Year) %>%
+  summarise(mean_aff = mean(n_universities, na.rm = TRUE), .groups = "drop")
+
+ggplot(mean_aff_years, aes(x = Pub_Year, y = mean_aff)) +
+  geom_line(color = "darkgoldenrod2", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year", y = "Mean number of affiliations") +
+  scale_x_continuous(breaks = seq(2005, 2019, by = 1))
+```
+
+# Diversity indices
+
+## Indices calculation
+
+We use Shannon entropy to compute a diversity index for gender and for affiliation.
+Entropy is computed per article on the counts of contributors in each category (male/female for gender; institution for affiliation).
+
+```{r shannon-entropy}
+# Counts are built in long format and passed to vegan::diversity() per article,
+# instead of pivoting to a wide article x institution matrix and using rowwise().
+# The index is the same; it is just much lighter on memory and time.
+
+gender_div <- contributions %>%
+  left_join(actor %>% select(H_ID, Gender), by = c("contributor" = "H_ID")) %>%
+  filter(Gender %in% c("male", "female")) %>%
+  count(UT, Gender, name = "n_gender") %>%
+  group_by(UT) %>%
+  summarise(gender_diversity = diversity(n_gender, index = "shannon"),
+            .groups = "drop")
+
+affiliation_div <- cont_with_aff %>%
+  filter(!is.na(Inst_ID)) %>%
+  count(UT, Inst_ID, name = "n_uni") %>%
+  group_by(UT) %>%
+  summarise(affiliation_diversity = diversity(n_uni, index = "shannon"),
+            .groups = "drop")
+
+diversity_tbl <- div_article %>%
+  left_join(gender_div, by = "UT") %>%
+  left_join(affiliation_div, by = "UT") %>%
+  select(UT, n_conts, gender_diversity, affiliation_diversity, TC,
+         Journal_Complete, Pub_Year)
+```
+
+## Correlation check
+
+We check the correlation between the number of contributors and the diversity indices, to rule out multicollinearity problems in the model.
+There is a moderate correlation between affiliation diversity and the number of contributors, which should not be problematic.
+
+```{r correlation-plots, echo=FALSE}
+ggplot(diversity_tbl, aes(x = gender_diversity, y = n_conts)) +
+  geom_point(color = "coral2", alpha = 0.3) +
+  theme_minimal() +
+  labs(x = "Gender diversity", y = "Number of contributors") +
+  stat_poly_eq(use_label("R2"))
+
+ggplot(diversity_tbl, aes(x = affiliation_diversity, y = n_conts)) +
+  geom_point(color = "darkgoldenrod2", alpha = 0.3) +
+  theme_minimal() +
+  labs(x = "Affiliation diversity", y = "Number of contributors") +
+  stat_poly_eq(use_label("R2"))
+```
+
+## Controls and final sample
+
+We use journal, publication year and sub-field as fixed effects, and the number of contributors, prize winners and officials as controls.
+
+```{r controls-and-final-table}
+# Prize winners among the contributors
+prize_count <- contributions %>%
+  semi_join(prize, by = c("contributor" = "H_ID")) %>%
+  group_by(UT) %>%
+  summarise(n_prize_winners = n_distinct(contributor), .groups = "drop")
+
+# Contributors holding official roles in associations
+role_count <- contributions %>%
+  semi_join(association, by = c("contributor" = "H_ID")) %>%
+  group_by(UT) %>%
+  summarise(n_official_roles = n_distinct(contributor), .groups = "drop")
+
+# Sub-field clusters (coarse resolution)
+clusters <- clustering %>%
+  filter(Resolution == "Coarse") %>%
+  select(UT, Cluster)
+
+# We merge all data in a single table
+art_div <- diversity_tbl %>%
+  left_join(prize_count, by = "UT") %>%
+  left_join(role_count, by = "UT") %>%
+  mutate(n_prize_winners  = coalesce(n_prize_winners, 0),
+         n_official_roles = coalesce(n_official_roles, 0)) %>%
+  left_join(clusters, by = "UT")
+
+# Joins must not duplicate articles
+if (anyDuplicated(art_div$UT) > 0) {
+  warning("art_div has duplicated UT values: check the joins (e.g. `clustering`).")
+}
+
+nrow(art_div)   # sample size check (5174 in the original run)
+```
+
+fixest silently drops rows with missing values in any variable used by a model, so models with different variables would end up on different samples (5,110 vs 5,122 rows in the original run), and AIC/BIC comparisons across them would not be valid.
+We therefore build **one common estimation sample** and use it for all models below.
+
+```{r final-sample}
+model_vars <- c("TC", "gender_diversity", "affiliation_diversity", "n_conts",
+                "n_prize_winners", "n_official_roles",
+                "Journal_Complete", "Pub_Year", "Cluster")
+
+model_data <- art_div %>% drop_na(all_of(model_vars))
+
+nrow(model_data)   # 5110 in the original run
+```
+
+A 10-row preview of the final table:
+
+```{r preview-final-table}
+model_data %>%
+  select(-UT) %>%
+  slice_head(n = 10) %>%
+  reactable()
+```
+
+# Regression
+
+## Model
+
+We use a negative binomial regression with fixed effects.
+The dependent variable is the citation count; the independent variables are gender and affiliation diversity, with the controls and fixed effects described above.
+
+```{r regression-eq}
+gender_and_affil_fenegbin <- fenegbin(
+  TC ~ gender_diversity + affiliation_diversity + n_conts +
+    n_prize_winners + n_official_roles
+  | Journal_Complete + Pub_Year + Cluster,
+  data = model_data
+)
+```
+
+## Results
+
+Here are the results of the model:
+
+```{r results}
+summary(gender_and_affil_fenegbin, vcov = "iid")
+```
+
+To interpret the coefficients more easily we exponentiate them to obtain incidence rate ratios (IRR).
+An IRR of 1.10 indicates a 10% increase in expected citations for each one-unit increase in the predictor.
+The 95% confidence interval is reported as `IRR_low` (smallest plausible effect) and `IRR_high` (largest plausible effect).
+
+```{r irr}
+tidy(gender_and_affil_fenegbin, vcov = "iid", effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    IRR      = round(exp(estimate), digits = 4),
+    IRR_low  = round(exp(conf.low), digits = 4),
+    IRR_high = round(exp(conf.high), digits = 4)
+  ) %>%
+  mutate(stat_sing = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01  ~ "**",
+    p.value < 0.05  ~ "*",
+    p.value < 0.1   ~ ".",
+    TRUE            ~ ""
+  )) %>%
+  select(term, IRR, IRR_low, IRR_high, stat_sing) %>%
+  reactable()
+```
+
+# Gender diversity across disciplines
+
+The effect of gender diversity is not significant overall.
+However, gender diversity varies between sub-fields that are cited to different extents: on average, the most gender-diverse sub-fields are also the most cited.
+(This comparison rests on about nine sub-fields and is purely descriptive.)
+
+```{r between-disciplines-gender, echo=FALSE}
+p_between <- model_data %>%
+  group_by(Cluster) %>%
+  summarise(
+    n_articles           = n_distinct(UT),
+    avg_citations        = mean(TC),
+    avg_gender_diversity = mean(gender_diversity, na.rm = TRUE),
+    avg_aff_diversity    = mean(affiliation_diversity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(cluster %>% filter(Resolution == "Coarse"), by = "Cluster") %>%
+  arrange(Cluster) %>%
+  select(Cluster_Label, n_articles, avg_citations,
+         avg_gender_diversity, avg_aff_diversity) %>%
+  ggplot(aes(x = avg_gender_diversity, y = avg_citations, color = Cluster_Label)) +
+  geom_point(aes(size = n_articles)) +
+  geom_text_repel(aes(label = Cluster_Label)) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  stat_poly_line(color = "blue", se = FALSE) +
+  stat_poly_eq(use_label("R2"), color = "blue") +
+  labs(
+    title = "Citations vs. Gender Diversity (between disciplines)",
+    x = "Avg. Gender diversity index",
+    y = "Avg. Citations",
+    size = "Number of papers"
+  )
+
+p_between
+
+# Figure used in the README
+dir.create(here("figures"), showWarnings = FALSE)
+ggsave(here("figures", "gender_diversity_between_subfields.png"),
+       p_between, width = 7, height = 5, dpi = 150)
+```
+
+On the other hand, **within** a sub-field gender diversity is not associated with an increase in citations.
+
+```{r within-disciplines-gender, echo=FALSE, fig.height=8, fig.width=10}
+model_data %>%
+  left_join(cluster %>%
+              filter(Resolution == "Coarse") %>%
+              select(Cluster, Cluster_Label), by = "Cluster") %>%
+  ggplot(aes(x = gender_diversity, y = TC, color = Cluster_Label)) +
+  geom_jitter(width = 0.05, height = 0, alpha = 0.5, size = 1.5) +
+  # wrap long sub-field names so that panel titles are not cut off
+  facet_wrap(~ Cluster_Label, scales = "free_y",
+             labeller = label_wrap_gen(width = 28)) +
+  labs(
+    title = "Citations vs. Gender Diversity (within disciplines)",
+    x = "Gender diversity index",
+    y = "Citations"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none", strip.text = element_text(size = 9)) +
+  stat_poly_line(color = "blue", se = FALSE) +
+  stat_poly_eq(use_label("R2"), color = "blue")
+```
+
+# Gender and affiliation have additive effects
+
+We also inspect whether gender and affiliation diversity have additive effects.
+First, there is little correlation between the two.
+
+```{r correlation-diversities, echo=FALSE}
+p_gender_vs_aff <- ggplot(diversity_tbl,
+                          aes(x = gender_diversity, y = affiliation_diversity)) +
+  geom_point(color = "deepskyblue") +
+  theme_minimal() +
+  labs(x = "Gender diversity", y = "Affiliation diversity") +
+  stat_poly_eq(use_label("R2"))
+
+p_gender_vs_aff
+
+# Figure used in the README
+ggsave(here("figures", "gender_vs_affiliation_diversity.png"),
+       p_gender_vs_aff, width = 7, height = 5, dpi = 150)
+```
+
+To further support this, we fit two more models, each with only one kind of diversity (same sample, same controls and fixed effects as above).
+
+```{r comparison-models}
+gender_only_fenegbin <- fenegbin(
+  TC ~ gender_diversity + n_conts + n_prize_winners + n_official_roles
+  | Journal_Complete + Pub_Year + Cluster,
+  data = model_data
+)
+
+affiliation_only_fenegbin <- fenegbin(
+  TC ~ affiliation_diversity + n_conts + n_prize_winners + n_official_roles
+  | Journal_Complete + Pub_Year + Cluster,
+  data = model_data
+)
+```
+
+Comparing the models:
+
+```{r comparative-table}
+models <- list(
+  "Gender and Affiliation" = gender_and_affil_fenegbin,
+  "Gender diversity"       = gender_only_fenegbin,
+  "Affiliation diversity"  = affiliation_only_fenegbin
+)
+
+modelsummary(models,
+             vcov = "iid",
+             stars = TRUE,
+             statistic = "p.value",
+             fmt = 5,
+             gof_omit = "Std.Errors|FE")
+```
