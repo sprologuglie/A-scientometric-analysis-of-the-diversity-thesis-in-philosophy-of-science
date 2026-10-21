@@ -2,7 +2,7 @@
 
 An R analysis of whether the **gender** and **institutional diversity** of the people behind a journal article (its authors *and* the colleagues acknowledged in it) is associated with how often the article is cited.
 
-**[Read the full report online →](https://github.com/sprologuglie/A-scientometric-analysis-of-the-diversity-thesis-in-philosophy-of-science)**
+**[Read the full report online →](https://sprologuglie.github.io/A-scientometric-analysis-of-the-diversity-thesis-in-philosophy-of-science/)**
 
 ## At a glance
 
